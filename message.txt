@@ -1,0 +1,146 @@
+!pip install git+https://github.com/facebookresearch/segment-anything-2.git
+!pip install ipywidgets opencv-python pillow matplotlib tqdm
+
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from PIL import Image
+import os
+import cv2
+from tqdm import tqdm
+from ipywidgets import interact, Dropdown, Button, HBox, VBox
+
+from sam2.build_sam import build_sam2
+from sam2.automatic_mask_generator import SAM2AutomaticMaskGenerator
+
+# ---------------- CONFIGURATION ---------------- #
+# Paths for Colab
+BASE_DIR = "/content/dataset_to_annotate"
+IMAGE_SOURCE_DIR = os.path.join(BASE_DIR, "train")
+MASK_OUTPUT_DIR = os.path.join(BASE_DIR, "annotated_masks")
+CHECKPOINTS_DIR = os.path.join(BASE_DIR, "checkpoints")
+CONFIGS_DIR = os.path.join(BASE_DIR, "sam2", "configs", "sam2.1")
+os.makedirs(MASK_OUTPUT_DIR, exist_ok=True)
+os.makedirs(CHECKPOINTS_DIR, exist_ok=True)
+os.makedirs(CONFIGS_DIR, exist_ok=True)
+
+# Download model checkpoint and config
+if not os.path.exists(os.path.join(CHECKPOINTS_DIR, "sam2.1_hiera_large.pt")):
+    !wget -O {CHECKPOINTS_DIR}/sam2.1_hiera_large.pt https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt
+
+if not os.path.exists(os.path.join(CONFIGS_DIR, "sam2.1_hiera_l.yaml")):
+    !wget -O {CONFIGS_DIR}/sam2.1_hiera_l.yaml https://raw.githubusercontent.com/facebookresearch/segment-anything-2/main/configs/sam2.1/sam2.1_hiera_l.yaml
+
+# Example: pixels per meter for area calculation
+PIXELS_PER_METER = 350.0
+
+# Class map
+CLASS_MAP = {
+    '1': {'name': 'growing_area', 'value': 1, 'color': [0, 255, 0]},
+    '2': {'name': 'safety_zone', 'value': 2, 'color': [255, 0, 0]},
+}
+
+# ---------------- LOAD MODEL ---------------- #
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+print("Loading SAM2 model...")
+
+sam2_checkpoint = os.path.join(CHECKPOINTS_DIR, "sam2.1_hiera_large.pt")
+model_cfg = os.path.join(CONFIGS_DIR, "sam2.1_hiera_l.yaml")
+sam2 = build_sam2(model_cfg, sam2_checkpoint, device=device)
+mask_generator = SAM2AutomaticMaskGenerator(sam2)
+print("Model loaded.")
+
+# ---------------- INTERACTIVE ANNOTATOR ---------------- #
+class ColabAnnotator:
+    def __init__(self, image_path, generated_masks):
+        self.image_path = image_path
+        self.image = np.array(Image.open(image_path).convert("RGB"))
+        self.generated_masks = generated_masks
+        self.semantic_mask = np.zeros(self.image.shape[:2], dtype=np.uint8)
+        self.current_mask_idx = 0
+
+        self.label_dropdown = Dropdown(
+            options=[("Background", "0")] + [(f"{v['name']}", k) for k, v in CLASS_MAP.items()],
+            description="Label:"
+        )
+        self.next_button = Button(description="Next Mask", button_style='success')
+        self.save_button = Button(description="Save & Next Image", button_style='info')
+
+        self.next_button.on_click(self.next_mask)
+        self.save_button.on_click(self.save_mask_and_calculate)
+
+        self.show_mask()
+
+    def show_mask(self):
+        plt.figure(figsize=(10, 10))
+        plt.imshow(self.image)
+        mask = self.generated_masks[self.current_mask_idx]['segmentation']
+        overlay = np.zeros((*mask.shape, 4), dtype=np.float32)
+        overlay[mask] = [1, 0, 0, 0.5]
+        plt.imshow(overlay)
+        plt.axis("off")
+        plt.show()
+        display(HBox([self.label_dropdown, self.next_button, self.save_button]))
+
+    def next_mask(self, b=None):
+        label_key = self.label_dropdown.value
+        mask = self.generated_masks[self.current_mask_idx]['segmentation']
+        if label_key in CLASS_MAP:
+            self.semantic_mask[mask] = CLASS_MAP[label_key]['value']
+        elif label_key == '0':
+            self.semantic_mask[mask] = 0
+        self.current_mask_idx += 1
+        if self.current_mask_idx < len(self.generated_masks):
+            self.show_mask()
+        else:
+            print("All masks labeled for this image. Click 'Save & Next Image'.")
+
+    def save_mask_and_calculate(self, b=None):
+        filename = os.path.basename(self.image_path)
+        name, _ = os.path.splitext(filename)
+        output_path = os.path.join(MASK_OUTPUT_DIR, f"{name}.png")
+        Image.fromarray(self.semantic_mask).save(output_path)
+        print(f"Mask saved to {output_path}")
+
+        growing_mask = (self.semantic_mask == 1).astype(np.uint8)
+        if cv2.countNonZero(growing_mask) > 0:
+            total_pixel_area = cv2.countNonZero(growing_mask)
+            total_real_area = total_pixel_area / (PIXELS_PER_METER**2)
+
+            contours, _ = cv2.findContours(growing_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                largest_contour = max(contours, key=cv2.contourArea)
+                x, y, w, h = cv2.boundingRect(largest_contour)
+                real_w = w / PIXELS_PER_METER
+                real_h = h / PIXELS_PER_METER
+
+                print("\n--- Growing Area Dimensions ---")
+                print(f"  Total Usable Area: {total_real_area:.2f} sq. meters")
+                print(f"  Largest Rectangular Plot:")
+                print(f"    - Width: {real_w:.2f} meters")
+                print(f"    - Height: {real_h:.2f} meters")
+                print("---------------------------------")
+
+# ---------------- MAIN LOOP ---------------- #
+image_paths = []
+for dirpath, _, filenames in os.walk(IMAGE_SOURCE_DIR):
+    for filename in filenames:
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg')):
+            image_paths.append(os.path.join(dirpath, filename))
+image_paths.sort()
+
+if not image_paths:
+    print(f"No images found in {IMAGE_SOURCE_DIR}")
+else:
+    for image_path in image_paths:
+        name, _ = os.path.splitext(os.path.basename(image_path))
+        if os.path.exists(os.path.join(MASK_OUTPUT_DIR, f"{name}.png")):
+            print(f"Skipping {os.path.basename(image_path)}, already annotated.")
+            continue
+        print(f"\nProcessing {image_path}...")
+        image_rgb = np.array(Image.open(image_path).convert("RGB"))
+        generated_masks = mask_generator.generate(image_rgb)
+        generated_masks = sorted(generated_masks, key=lambda x: x['area'])
+        annotator = ColabAnnotator(image_path, generated_masks)
+        break  # Show only one image at a time

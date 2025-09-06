@@ -1,0 +1,14 @@
+# requirements.txt
+flask
+torch
+torchvision
+opencv-python-headless
+pandas
+Pillow
+numpy
+openmeteo-requests
+requests-cache
+retry-requests
+sarvamai
+pytz
+werkzeug
